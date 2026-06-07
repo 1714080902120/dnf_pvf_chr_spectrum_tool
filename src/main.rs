@@ -27,6 +27,11 @@ struct Config {
     allow_small_frame_name_contains: Vec<String>,
     blacklist_name_contains: Vec<String>,
     case_insensitive: bool,
+    direct_ani: bool,
+    /// 直接扫描（common/独立 .ani）模式下，判定“和人物相关”的 img 路径关键词：
+    /// .ani 必须引用包含其中任一关键词的图片才处理。默认 `Equipment/Avatar/skin`
+    /// （角色 avatar body 图）。留空则不按 img 过滤（处理范围内所有 .ani）。
+    character_image_markers: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +97,9 @@ struct ChrContext {
     body_path: Vec<u8>,
     body_path_text: String,
     ani_refs: Vec<Vec<u8>>,
+    /// true 表示这是一个独立的 `.ani` 目标（直接扫描，不做 body image path 匹配）；
+    /// false 表示由 `.chr` 驱动、需要匹配角色 body。同一次运行里两者可以共存。
+    direct_ani: bool,
 }
 
 fn main() {
@@ -116,7 +124,11 @@ fn run() -> AppResult<()> {
                 .unwrap_or_else(|| PathBuf::from("report_scan.csv"));
             let mut config = load_config(optional_arg(&args, "--config"))?;
             apply_cli_overrides(&mut config, &args);
-            let rows = scan(Path::new(&root), &config, "scan")?;
+            let root_path = PathBuf::from(&root);
+            let scope = optional_arg(&args, "--scope")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| root_path.clone());
+            let rows = scan(&root_path, &scope, &config, "scan")?;
             write_report(&report, &rows)?;
             println!("scan complete: {} rows -> {}", rows.len(), report.display());
         }
@@ -129,8 +141,13 @@ fn run() -> AppResult<()> {
                 .unwrap_or_else(|| PathBuf::from(&out).join("report.csv"));
             let mut config = load_config(optional_arg(&args, "--config"))?;
             apply_cli_overrides(&mut config, &args);
+            let root_path = PathBuf::from(&root);
+            let scope = optional_arg(&args, "--scope")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| root_path.clone());
             let (rows, manifest_path, archive_path) = apply(
-                Path::new(&root),
+                &root_path,
+                &scope,
                 Path::new(&out),
                 Path::new(&backup),
                 &report,
@@ -246,6 +263,7 @@ fn install_gui_style(ctx: &egui::Context) {
 
 struct GuiApp {
     export_root: String,
+    base_override: String,
     output_root: String,
     backup_root: String,
     report_path: String,
@@ -254,6 +272,7 @@ struct GuiApp {
     config: Config,
     small_frame_keywords: String,
     blacklist_keywords: String,
+    character_keywords: String,
     status: String,
     last_report: Option<PathBuf>,
     last_output: Option<PathBuf>,
@@ -293,6 +312,7 @@ impl Default for GuiApp {
         let config = Config::default();
         Self {
             export_root: String::new(),
+            base_override: String::new(),
             output_root: String::new(),
             backup_root: String::new(),
             report_path: String::new(),
@@ -300,6 +320,7 @@ impl Default for GuiApp {
             restore_target: String::new(),
             small_frame_keywords: config.allow_small_frame_name_contains.join(", "),
             blacklist_keywords: config.blacklist_name_contains.join(", "),
+            character_keywords: config.character_image_markers.join(", "),
             config,
             status: "请选择 PVF 导出目录，然后执行扫描或应用修改。".to_string(),
             last_report: None,
@@ -324,14 +345,25 @@ impl eframe::App for GuiApp {
                 ui.label("路径");
                 path_row(
                     ui,
-                    "PVF 导出目录",
+                    "PVF 导出目录 / 要处理的目录",
                     &mut self.export_root,
                     BrowseKind::Folder,
-                    "从 PVF 编辑器导出的原始目录；工具只读取，不直接修改。",
+                    "从 PVF 编辑器导出的原始目录；工具只读取，不直接修改。\
+                     只跑 common 时，直接把这里填成 …/character/common、下面那行留空即可——\
+                     工具会自动往上找到 character 那层作为路径基准，7z 前缀仍是 character/common/…，导回位置正确。",
+                );
+                path_row(
+                    ui,
+                    "路径基准(可选,一般留空)",
+                    &mut self.base_override,
+                    BrowseKind::Folder,
+                    "一般留空——工具会从上面的目录自动往上找到 character 那层做基准。\
+                     只有当自动识别不对时才手动填这里（应是含 character/ 的那层，例如 …/script）；\
+                     7z 内部路径会以它为基准计算，决定能否正确导回 PVF。",
                 );
                 if ui
                     .button("根据导出目录生成默认路径")
-                    .on_hover_text("自动生成输出目录、备份目录和报告路径。")
+                    .on_hover_text("自动生成输出目录、备份目录和报告路径（始终放在导出目录同级，不会落进源目录里）。")
                     .clicked()
                 {
                     self.fill_default_paths();
@@ -449,6 +481,12 @@ impl eframe::App for GuiApp {
                             "路径、body image path、黑名单和白名单匹配时忽略大小写。建议开启。",
                         );
                 });
+                ui.checkbox(&mut self.config.direct_ani, "强制直接扫描所有 .ani（高级）")
+                    .on_hover_text(
+                        "无需开启即可工作：common 目录下的公共动画会自动直接处理。\
+                         只有当你想对一个普通目录里的【每个】 .ani 都直接加残影、且不做 .chr/body 匹配时才勾选。\
+                         勾选后处理范围内所有 .ani 都是目标（仍遵守帧数规则和黑名单）。",
+                    );
                 help_text(
                     ui,
                     "帧数规则：FRAME MAX <= 2 跳过；等于 3 需命中白名单；大于等于最小值才处理。",
@@ -491,6 +529,16 @@ impl eframe::App for GuiApp {
                 help_text(
                     ui,
                     "用于跳过待机、受击、倒地、休息、占位等不适合加残影的动作。",
+                );
+                ui.label("人物相关 img 关键词（common/直接扫描用）");
+                ui.text_edit_singleline(&mut self.character_keywords)
+                    .on_hover_text(
+                        "只对【直接扫描】的 .ani（如 common 公共动画）生效：.ani 引用的图片路径必须包含这里任一关键词才处理，\
+                         用来只挑出和人物相关的动作、排除光环/特效/场景。用英文逗号分隔。默认 Equipment/Avatar/skin（角色 avatar body 图）。留空=不按 img 过滤。",
+                    );
+                help_text(
+                    ui,
+                    "普通角色（.chr 驱动）不受此项影响，仍按各自的 body image path 匹配。",
                 );
             });
 
@@ -709,14 +757,10 @@ impl GuiApp {
             self.status = "请先选择 PVF 导出目录。".to_string();
             return;
         }
-        let root = PathBuf::from(self.export_root.trim());
-        self.output_root = default_output_root(&root).display().to_string();
-        self.backup_root = root
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("backup")
-            .display()
-            .to_string();
+        let (base, scope) = resolve_base_scope(&self.export_root, &self.base_override);
+        let (output_root, backup_root) = default_output_and_backup(&base, &scope);
+        self.output_root = output_root.display().to_string();
+        self.backup_root = backup_root.display().to_string();
         self.report_path = PathBuf::from(&self.output_root)
             .join("report.csv")
             .display()
@@ -727,6 +771,7 @@ impl GuiApp {
     fn sync_keyword_config(&mut self) {
         self.config.allow_small_frame_name_contains = split_keywords(&self.small_frame_keywords);
         self.config.blacklist_name_contains = split_keywords(&self.blacklist_keywords);
+        self.config.character_image_markers = split_keywords(&self.character_keywords);
     }
 
     fn run_scan(&mut self) {
@@ -734,12 +779,11 @@ impl GuiApp {
             return;
         }
         self.sync_keyword_config();
-        let root = self.export_root.trim();
-        if root.is_empty() {
+        if self.export_root.trim().is_empty() {
             self.status = "扫描失败：PVF 导出目录不能为空。".to_string();
             return;
         }
-        let root = PathBuf::from(root);
+        let (root, scope) = resolve_base_scope(&self.export_root, &self.base_override);
         let report = self.scan_report_path();
         let config = self.config.clone();
         let (sender, receiver) = mpsc::channel();
@@ -755,7 +799,7 @@ impl GuiApp {
 
         thread::spawn(move || {
             let result = (|| -> Result<GuiTaskResult, String> {
-                let rows = scan_with_progress(&root, &config, "scan", |done, total, label| {
+                let rows = scan_with_progress(&root, &scope, &config, "scan", |done, total, label| {
                     let _ = sender.send(GuiTaskMessage::Progress {
                         done,
                         total,
@@ -790,7 +834,7 @@ impl GuiApp {
             self.status = "应用失败：导出目录、输出目录、备份目录都不能为空。".to_string();
             return;
         }
-        let root = PathBuf::from(self.export_root.trim());
+        let (root, scope) = resolve_base_scope(&self.export_root, &self.base_override);
         let out = PathBuf::from(self.output_root.trim());
         let backup = PathBuf::from(self.backup_root.trim());
         let report = self.apply_report_path();
@@ -808,6 +852,7 @@ impl GuiApp {
         thread::spawn(move || {
             let result = apply_with_progress_collect_errors(
                 &root,
+                &scope,
                 &out,
                 &backup,
                 &report,
@@ -971,6 +1016,65 @@ fn existing_policy_label(policy: ExistingPolicy) -> &'static str {
     }
 }
 
+/// 由用户填的“要处理的目录”和可选的“路径基准覆盖”推导出 (路径基准 base, 处理范围 scope)。
+///
+/// `target` 永远是“要处理的目录”(= scope)。
+/// - 填了 `base_override`：直接用它做基准（显式，最灵活）。
+/// - 留空：如果 target 位于某个 `character` 目录里（或就是 character 目录），自动把基准设为
+///   `character` 的上一级——这样即使只填一个框、直接指向 `…/character/common`，7z 里仍是
+///   `character/common/…` 的完整前缀，导回位置正确。找不到 `character` 分量时退回到
+///   base = scope = target（整树处理，适合直接填含 character/ 的导出根目录）。
+fn resolve_base_scope(target: &str, base_override: &str) -> (PathBuf, PathBuf) {
+    let scope = PathBuf::from(target.trim());
+    let base_text = base_override.trim();
+    if !base_text.is_empty() {
+        return (PathBuf::from(base_text), scope);
+    }
+    match base_above_character(&scope) {
+        Some(base) => (base, scope),
+        None => (scope.clone(), scope),
+    }
+}
+
+/// 找到路径里第一个名为 `character` 的目录分量，返回它的上一级目录；找不到返回 None。
+fn base_above_character(path: &Path) -> Option<PathBuf> {
+    let mut acc = PathBuf::new();
+    for component in path.components() {
+        if let Component::Normal(part) = component {
+            if part.to_str().is_some_and(|s| s.eq_ignore_ascii_case("character")) {
+                return Some(acc);
+            }
+        }
+        acc.push(component.as_os_str());
+    }
+    None
+}
+
+/// 默认输出目录和备份目录。
+/// 处理某个子目录时（scope 在 base 里面），输出放到 base 里面、按 scope 命名，
+/// 例如 base=…/script、scope=…/script/character → 输出 …/script/character_spectrum，
+/// scope=…/script/character/common → 输出 …/script/common_spectrum（在 script 里、不进 character）。
+/// 整树处理（scope == base）时退回到 base 同级，避免输出落在被处理目录里面。
+fn default_output_and_backup(base: &Path, scope: &Path) -> (PathBuf, PathBuf) {
+    let scope_name = scope
+        .file_name()
+        .and_then(OsStr::to_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("output");
+    if base == scope {
+        let out = default_output_root(base);
+        let backup = base
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("spectrum_backup");
+        (out, backup)
+    } else {
+        let out = base.join(format!("{scope_name}_spectrum"));
+        let backup = base.join(format!("{scope_name}_spectrum_backup"));
+        (out, backup)
+    }
+}
+
 fn default_output_root(root: &Path) -> PathBuf {
     let parent = root.parent().unwrap_or_else(|| Path::new("."));
     let name = root
@@ -984,8 +1088,8 @@ fn default_output_root(root: &Path) -> PathBuf {
 fn print_usage() {
     eprintln!(
         "Usage:
-  spectrum_tool scan --root <export_root> [--config config.json] [--report report_scan.csv]
-  spectrum_tool apply --root <export_root> --out <output_root> --backup <backup_root> [--config config.json] [--report report.csv] [--existing skip|update|force]
+  spectrum_tool scan --root <export_root> [--scope <subdir>] [--config config.json] [--report report_scan.csv]
+  spectrum_tool apply --root <export_root> [--scope <subdir>] --out <output_root> --backup <backup_root> [--config config.json] [--report report.csv] [--existing skip|update|force]
   spectrum_tool restore --manifest <manifest.json> --target <output_root> [--report restore_report.csv]
   spectrum_tool remove --manifest <manifest.json> --target <output_root> [--report restore_report.csv]
   spectrum_tool default-config"
@@ -1007,6 +1111,9 @@ fn apply_cli_overrides(config: &mut Config, args: &[String]) {
         if let Some(policy) = parse_existing_policy(&existing) {
             config.existing_policy = policy;
         }
+    }
+    if args.iter().any(|arg| arg == "--direct-ani") {
+        config.direct_ani = true;
     }
 }
 
@@ -1051,6 +1158,12 @@ fn load_config(path: Option<String>) -> AppResult<Config> {
     if let Some(case_insensitive) = json_bool(&text, "case_insensitive") {
         config.case_insensitive = case_insensitive;
     }
+    if let Some(direct_ani) = json_bool(&text, "direct_ani") {
+        config.direct_ani = direct_ani;
+    }
+    if let Some(values) = json_string_array(&text, "character_image_markers") {
+        config.character_image_markers = values;
+    }
 
     Ok(config)
 }
@@ -1092,6 +1205,8 @@ impl Default for Config {
                 "Overturn".to_string(),
             ],
             case_insensitive: true,
+            direct_ani: false,
+            character_image_markers: vec!["Equipment/Avatar/skin".to_string()],
         }
     }
 }
@@ -1105,8 +1220,8 @@ fn parse_existing_policy(value: &str) -> Option<ExistingPolicy> {
     }
 }
 
-fn scan(root: &Path, config: &Config, mode: &str) -> AppResult<Vec<ReportRow>> {
-    let contexts = load_chr_contexts(root)?;
+fn scan(root: &Path, scope: &Path, config: &Config, mode: &str) -> AppResult<Vec<ReportRow>> {
+    let contexts = load_contexts(root, scope, config)?;
     let mut rows = Vec::new();
     for context in contexts {
         for ani_ref in &context.ani_refs {
@@ -1119,6 +1234,7 @@ fn scan(root: &Path, config: &Config, mode: &str) -> AppResult<Vec<ReportRow>> {
 
 fn scan_with_progress<F>(
     root: &Path,
+    scope: &Path,
     config: &Config,
     mode: &str,
     mut progress: F,
@@ -1126,7 +1242,7 @@ fn scan_with_progress<F>(
 where
     F: FnMut(usize, usize, &str),
 {
-    let contexts = load_chr_contexts(root)?;
+    let contexts = load_contexts(root, scope, config)?;
     let total = contexts
         .iter()
         .map(|context| context.ani_refs.len())
@@ -1149,32 +1265,37 @@ where
 
 fn apply(
     root: &Path,
+    scope: &Path,
     out: &Path,
     backup_root: &Path,
     report_path: &Path,
     config: &Config,
 ) -> AppResult<(Vec<ReportRow>, PathBuf, PathBuf)> {
-    if path_is_same_or_inside(out, root)? {
-        return Err("output root must not be the same as, or inside, source root".into());
+    if !path_is_same_or_inside(scope, root)? {
+        return Err("scope directory must be the same as, or inside, source root".into());
     }
-    if path_is_same_or_inside(backup_root, root)? {
-        return Err("backup root must not be the same as, or inside, source root".into());
+    if path_is_same_or_inside(out, scope)? {
+        return Err("output root must not be the same as, or inside, the processed directory".into());
     }
-    if path_is_inside(report_path, root)? {
-        return Err("report path must not be inside source root".into());
+    if path_is_same_or_inside(backup_root, scope)? {
+        return Err("backup root must not be the same as, or inside, the processed directory".into());
+    }
+    if path_is_inside(report_path, scope)? {
+        return Err("report path must not be inside the processed directory".into());
     }
 
+    // 只输出改过的文件（覆盖合并导入即可），不再整树复制。
     fs::create_dir_all(out)?;
-    copy_tree(root, out)?;
 
     let batch_name = timestamp_name();
     let backup_batch = backup_root.join(batch_name);
     let backup_files = backup_batch.join("files");
     fs::create_dir_all(&backup_files)?;
 
-    let contexts = load_chr_contexts(root)?;
+    let contexts = load_contexts(root, scope, config)?;
     let mut rows = Vec::new();
     let mut manifest_entries = Vec::new();
+    let mut pack_entries = Vec::new();
     let mut written = HashSet::new();
 
     for context in contexts {
@@ -1236,6 +1357,7 @@ fn apply(
             row.backup_path = manifest_backup_path.clone();
 
             written.insert(rel_text.clone());
+            pack_entries.push(rel_text.clone());
             manifest_entries.push(ManifestEntry {
                 chr_path: context.rel_chr_path.clone(),
                 job: context.job.clone(),
@@ -1267,13 +1389,14 @@ fn apply(
     fs::write(&backup_manifest, &manifest_text)?;
     fs::write(out.join("manifest.json"), &manifest_text)?;
     let archive_path = default_7z_path(out);
-    create_output_7z_from_source(root, out, &archive_path)?;
+    pack_entries_to_7z(out, &pack_entries, &archive_path, |_| {})?;
 
     Ok((rows, backup_manifest, archive_path))
 }
 
 fn apply_with_progress_collect_errors<F>(
     root: &Path,
+    scope: &Path,
     out: &Path,
     backup_root: &Path,
     report_path: &Path,
@@ -1283,33 +1406,36 @@ fn apply_with_progress_collect_errors<F>(
 where
     F: FnMut(usize, usize, &str),
 {
-    if path_is_same_or_inside(out, root)? {
-        return Err("output root must not be the same as, or inside, source root".into());
+    if !path_is_same_or_inside(scope, root)? {
+        return Err("scope directory must be the same as, or inside, source root".into());
     }
-    if path_is_same_or_inside(backup_root, root)? {
-        return Err("backup root must not be the same as, or inside, source root".into());
+    if path_is_same_or_inside(out, scope)? {
+        return Err("output root must not be the same as, or inside, the processed directory".into());
     }
-    if path_is_inside(report_path, root)? {
-        return Err("report path must not be inside source root".into());
+    if path_is_same_or_inside(backup_root, scope)? {
+        return Err("backup root must not be the same as, or inside, the processed directory".into());
+    }
+    if path_is_inside(report_path, scope)? {
+        return Err("report path must not be inside the processed directory".into());
     }
 
+    // 只输出改过的文件（覆盖合并导入即可），不再整树复制。
     let mut failures = Vec::new();
-    progress(0, 0, "复制原始目录到输出目录");
     fs::create_dir_all(out)?;
-    copy_tree_collect_errors(root, out, &mut failures);
 
     let batch_name = timestamp_name();
     let backup_batch = backup_root.join(batch_name);
     let backup_files = backup_batch.join("files");
     fs::create_dir_all(&backup_files)?;
 
-    let contexts = load_chr_contexts(root)?;
+    let contexts = load_contexts(root, scope, config)?;
     let total = contexts
         .iter()
         .map(|context| context.ani_refs.len())
         .sum::<usize>();
     let mut rows = Vec::new();
     let mut manifest_entries = Vec::new();
+    let mut pack_entries = Vec::new();
     let mut written = HashSet::new();
     let mut done = 0;
     progress(done, total, "开始应用修改");
@@ -1479,6 +1605,7 @@ where
             row.backup_path = manifest_backup_path.clone();
 
             written.insert(rel_text.clone());
+            pack_entries.push(rel_text.clone());
             manifest_entries.push(ManifestEntry {
                 chr_path: context.rel_chr_path.clone(),
                 job: context.job.clone(),
@@ -1513,9 +1640,9 @@ where
     fs::write(&backup_manifest, &manifest_text)?;
     fs::write(out.join("manifest.json"), &manifest_text)?;
     let archive_path = default_7z_path(out);
-    progress(total, total, "打包 7z");
+    progress(total, total, "正在压缩打包 7z…");
     if let Err(err) =
-        create_output_7z_from_source_collect_errors(root, out, &archive_path, &mut failures)
+        pack_entries_to_7z(out, &pack_entries, &archive_path, |msg| progress(total, total, msg))
     {
         failures.push(format!("创建 7z 失败：{} -> {err}", archive_path.display()));
     }
@@ -1578,9 +1705,77 @@ fn restore(manifest_path: &Path, target: &Path, report_path: &Path) -> AppResult
     Ok(rows)
 }
 
-fn load_chr_contexts(root: &Path) -> AppResult<Vec<ChrContext>> {
+/// 在 `scope` 子树内收集处理目标，所有相对路径仍以 `root` 为基准。
+///
+/// 分流规则（一次运行同时生效）：
+/// - `config.direct_ani` 为真：scope 内**每个** `.ani` 都直接处理（高级覆盖，用于纯动画目录）。
+/// - 否则：普通角色走 `.chr` 驱动（做 body 匹配）；同时把 scope 内位于 `common` 目录下的
+///   `.ani` 自动改用直接扫描——这些公共动画没有 `.chr`，也不该按某个角色的 body 匹配。
+fn load_contexts(root: &Path, scope: &Path, config: &Config) -> AppResult<Vec<ChrContext>> {
+    if config.direct_ani {
+        return load_ani_contexts(root, scope, |_| true);
+    }
+    let mut contexts = load_chr_contexts(root, scope)?;
+    let mut common = load_ani_contexts(root, scope, has_common_component)?;
+    contexts.append(&mut common);
+    Ok(contexts)
+}
+
+/// 路径里是否含有名为 `common` 的目录分量（大小写不敏感，整段匹配，
+/// 所以 `common_spectrum` 这类不会被误判）。
+fn has_common_component(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        Component::Normal(part) => part
+            .to_str()
+            .is_some_and(|value| value.eq_ignore_ascii_case("common")),
+        _ => false,
+    })
+}
+
+/// 直接扫描 `.ani`：把 scope 内每个通过 `keep` 过滤的 `.ani` 当作独立处理目标，无需 `.chr` 入口。
+/// 生成的上下文 `direct_ani = true`，body_path 留空——evaluate_ani 会跳过 body 匹配。
+fn load_ani_contexts(
+    root: &Path,
+    scope: &Path,
+    keep: impl Fn(&Path) -> bool,
+) -> AppResult<Vec<ChrContext>> {
+    let mut ani_files = Vec::new();
+    walk_files_with_ext(scope, "ani", &mut ani_files)?;
+    ani_files.sort();
+
+    let mut contexts = Vec::new();
+    for ani_path in ani_files {
+        if !keep(&ani_path) {
+            continue;
+        }
+        let rel_chr_path = normalize_path_text(&relative_path(root, &ani_path)?);
+        let chr_dir = ani_path
+            .parent()
+            .ok_or_else(|| format!("ani path has no parent: {}", ani_path.display()))?
+            .to_path_buf();
+        let file_name = ani_path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| format!("ani path has no file name: {}", ani_path.display()))?
+            .as_bytes()
+            .to_vec();
+        contexts.push(ChrContext {
+            rel_chr_path,
+            chr_dir,
+            job: String::new(),
+            body_path: Vec::new(),
+            body_path_text: String::new(),
+            ani_refs: vec![file_name],
+            direct_ani: true,
+        });
+    }
+
+    Ok(contexts)
+}
+
+fn load_chr_contexts(root: &Path, scope: &Path) -> AppResult<Vec<ChrContext>> {
     let mut chr_files = Vec::new();
-    walk_files_with_ext(root, "chr", &mut chr_files)?;
+    walk_files_with_ext(scope, "chr", &mut chr_files)?;
     chr_files.sort();
 
     let mut contexts = Vec::new();
@@ -1602,6 +1797,7 @@ fn load_chr_contexts(root: &Path) -> AppResult<Vec<ChrContext>> {
                 body_path: Vec::new(),
                 body_path_text: String::new(),
                 ani_refs: Vec::new(),
+                direct_ani: false,
             });
             continue;
         };
@@ -1613,6 +1809,7 @@ fn load_chr_contexts(root: &Path) -> AppResult<Vec<ChrContext>> {
             body_path_text: display_bytes(&body_path),
             body_path,
             ani_refs,
+            direct_ani: false,
         });
     }
 
@@ -1648,7 +1845,7 @@ fn evaluate_ani(
         backup_path: String::new(),
     };
 
-    if context.body_path.is_empty() {
+    if !context.direct_ani && context.body_path.is_empty() {
         row.reason = "skip_chr_no_body_path".to_string();
         return Ok(row);
     }
@@ -1671,7 +1868,19 @@ fn evaluate_ani(
     row.sha256_before = sha_before.clone();
     row.sha256_after = sha_before;
 
-    if !contains_body_image_path(&bytes, &context.body_path, config.case_insensitive) {
+    if context.direct_ani {
+        // 直接扫描（common/独立 .ani）：没有具体 .chr 的 body path，改用通用的
+        // “人物相关 img 关键词”来判定——只处理引用角色 body 图的 .ani，
+        // 把光环、特效、场景之类排除掉。
+        if !references_character_image(
+            &bytes,
+            &config.character_image_markers,
+            config.case_insensitive,
+        ) {
+            row.reason = "skip_not_character_ani".to_string();
+            return Ok(row);
+        }
+    } else if !contains_body_image_path(&bytes, &context.body_path, config.case_insensitive) {
         row.reason = "skip_not_body_ani".to_string();
         return Ok(row);
     }
@@ -1846,6 +2055,22 @@ fn contains_normalized_path(haystack: &[u8], needle: &[u8], case_insensitive: bo
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+/// 直接扫描模式下判定 .ani 是否“和人物相关”：内容里是否引用了包含任一关键词的 img 路径
+/// （默认 `Equipment/Avatar/skin`，即角色 avatar body 图）。关键词列表为空时返回 true（不过滤）。
+fn references_character_image(haystack: &[u8], markers: &[String], case_insensitive: bool) -> bool {
+    if markers.is_empty() {
+        return true;
+    }
+    let haystack = normalize_path_bytes(haystack, case_insensitive);
+    markers.iter().any(|marker| {
+        let needle = normalize_path_bytes(marker.as_bytes(), case_insensitive);
+        !needle.is_empty()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+    })
 }
 
 fn contains_body_image_path(haystack: &[u8], body_path: &[u8], case_insensitive: bool) -> bool {
@@ -2040,78 +2265,6 @@ fn walk_files_with_ext(root: &Path, ext: &str, out: &mut Vec<PathBuf>) -> io::Re
     Ok(())
 }
 
-fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let source_path = entry.path();
-        let dest_path = dst.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            copy_tree(&source_path, &dest_path)?;
-        } else if file_type.is_file() {
-            if let Some(parent) = dest_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(&source_path, &dest_path)?;
-        }
-    }
-    Ok(())
-}
-
-fn copy_tree_collect_errors(src: &Path, dst: &Path, failures: &mut Vec<String>) {
-    if let Err(err) = fs::create_dir_all(dst) {
-        failures.push(format!("创建输出目录失败：{} -> {err}", dst.display()));
-        return;
-    }
-    let entries = match fs::read_dir(src) {
-        Ok(entries) => entries,
-        Err(err) => {
-            failures.push(format!("读取目录失败：{} -> {err}", src.display()));
-            return;
-        }
-    };
-
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(err) => {
-                failures.push(format!("读取目录项失败：{} -> {err}", src.display()));
-                continue;
-            }
-        };
-        let source_path = entry.path();
-        let dest_path = dst.join(entry.file_name());
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(err) => {
-                failures.push(format!(
-                    "读取文件类型失败：{} -> {err}",
-                    source_path.display()
-                ));
-                continue;
-            }
-        };
-        if file_type.is_dir() {
-            copy_tree_collect_errors(&source_path, &dest_path, failures);
-        } else if file_type.is_file() {
-            if let Some(parent) = dest_path.parent() {
-                if let Err(err) = fs::create_dir_all(parent) {
-                    failures.push(format!("创建输出目录失败：{} -> {err}", parent.display()));
-                    continue;
-                }
-            }
-            if let Err(err) = fs::copy(&source_path, &dest_path) {
-                failures.push(format!(
-                    "复制文件失败：{} -> {}：{err}",
-                    source_path.display(),
-                    dest_path.display()
-                ));
-            }
-        }
-    }
-}
-
 fn default_7z_path(out: &Path) -> PathBuf {
     let name = out
         .file_name()
@@ -2123,70 +2276,28 @@ fn default_7z_path(out: &Path) -> PathBuf {
         .join(format!("{name}.7z"))
 }
 
-fn create_output_7z_from_source(
-    source_root: &Path,
+/// 把指定的相对路径列表打包成 7z（只打改过的文件，覆盖合并导入即可）。
+/// `entries` 是相对 `output_root` 的条目路径（也就是 7z 内部路径，保留 character/... 完整前缀）。
+fn pack_entries_to_7z(
     output_root: &Path,
+    entries: &[String],
     archive_path: &Path,
+    mut heartbeat: impl FnMut(&str),
 ) -> AppResult<()> {
-    let mut failures = Vec::new();
-    create_output_7z_from_source_collect_errors(
-        source_root,
-        output_root,
-        archive_path,
-        &mut failures,
-    )?;
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(failures.join("; ").into())
+    if entries.is_empty() {
+        return Err("没有可打包的文件（没有任何 ANI 被修改）。".into());
     }
-}
-
-fn create_output_7z_from_source_collect_errors(
-    source_root: &Path,
-    output_root: &Path,
-    archive_path: &Path,
-    failures: &mut Vec<String>,
-) -> AppResult<()> {
     let seven_zip = find_7z_command()
         .ok_or_else(|| "未找到 7z.exe。请安装 7-Zip，或把 7z.exe 加入 PATH。".to_string())?;
-
-    let mut source_files = Vec::new();
-    collect_all_files(source_root, &mut source_files)?;
-    source_files.sort();
 
     if let Some(parent) = archive_path.parent() {
         fs::create_dir_all(parent)?;
     }
 
     let mut list_content = vec![0xef, 0xbb, 0xbf];
-    for source_file in source_files {
-        let rel = match relative_path(source_root, &source_file) {
-            Ok(rel) => rel,
-            Err(err) => {
-                failures.push(format!(
-                    "计算 7z 相对路径失败：{} -> {err}",
-                    source_file.display()
-                ));
-                continue;
-            }
-        };
-        let output_file = output_root.join(&rel);
-        let entry_name = normalize_path_text(&rel);
-        if let Err(err) = fs::metadata(&output_file) {
-            failures.push(format!(
-                "7z 缺少输出文件：{} -> {}：{err}",
-                entry_name,
-                output_file.display()
-            ));
-            continue;
-        }
-        list_content.extend_from_slice(entry_name.as_bytes());
+    for entry in entries {
+        list_content.extend_from_slice(entry.as_bytes());
         list_content.extend_from_slice(b"\r\n");
-    }
-
-    if list_content.len() <= 3 {
-        return Err("没有可打包的输入文件。".into());
     }
 
     if archive_path.exists() {
@@ -2196,43 +2307,65 @@ fn create_output_7z_from_source_collect_errors(
     let list_path = archive_path.with_extension("7z.list.txt");
     fs::write(&list_path, list_content)?;
 
-    let output = command_no_window(&seven_zip)
+    // 7z 的输出重定向到日志文件而不是管道：这样下面用 spawn + 轮询发心跳时，
+    // 不会因为没人读管道、管道写满而把 7z 卡死。
+    let log_path = archive_path.with_extension("7z.log.txt");
+    let log_out = fs::File::create(&log_path)?;
+    let log_err = log_out.try_clone()?;
+
+    // -m0=lzma + 较低的 -mx：对纯文本 .ani 压缩比几乎一样，但速度快几十倍
+    //（整棵 character 树从 -mx=9 的约 3.5 分钟降到约 8 秒），同时字典更小、用 LZMA1，
+    // 老旧的 SevenZipSharp 读取引擎兼容性也更好。
+    let spawned = command_no_window(&seven_zip)
         .current_dir(output_root)
         .arg("a")
         .arg("-t7z")
-        .arg("-mx=9")
+        .arg("-m0=lzma")
+        .arg("-mx=3")
         .arg("-y")
         .arg("-scsUTF-8")
         .arg(archive_path)
         .arg(format!("@{}", list_path.display()))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
+        .stdout(Stdio::from(log_out))
+        .stderr(Stdio::from(log_err))
+        .spawn();
+
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(err) => {
+            let _ = fs::remove_file(&list_path);
+            let _ = fs::remove_file(&log_path);
+            return Err(format!("启动 7z 失败：{err}").into());
+        }
+    };
+
+    // 轮询等待，同时定期发心跳，让界面显示“打包中（已用 Ns）”而不是看起来卡死。
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                heartbeat(&format!(
+                    "正在压缩打包 7z…（已用 {}s，文件多时请耐心等待）",
+                    start.elapsed().as_secs()
+                ));
+                thread::sleep(std::time::Duration::from_millis(400));
+            }
+            Err(err) => {
+                let _ = fs::remove_file(&list_path);
+                let _ = fs::remove_file(&log_path);
+                return Err(format!("等待 7z 失败：{err}").into());
+            }
+        }
+    };
 
     let _ = fs::remove_file(&list_path);
-    let output = output?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(format!("7z 打包失败：{}\n{}", stderr.trim(), stdout.trim()).into());
+    if !status.success() {
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        let _ = fs::remove_file(&log_path);
+        return Err(format!("7z 打包失败：{}", log.trim()).into());
     }
-    Ok(())
-}
-
-fn collect_all_files(root: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
-    if !root.exists() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            collect_all_files(&path, out)?;
-        } else if file_type.is_file() {
-            out.push(path);
-        }
-    }
+    let _ = fs::remove_file(&log_path);
     Ok(())
 }
 
@@ -2358,7 +2491,7 @@ fn config_json(config: &Config, indent: usize) -> String {
     let pad = " ".repeat(indent);
     let pad2 = " ".repeat(indent + 2);
     format!(
-        "{{\n{pad2}\"spectrum\": {{\n{pad2}  \"enabled\": {enabled},\n{pad2}  \"term\": {term},\n{pad2}  \"life_time\": {life_time},\n{pad2}  \"color\": [{r}, {g}, {b}, {a}],\n{pad2}  \"effect\": \"{effect}\"\n{pad2}}},\n{pad2}\"existing_spectrum_policy\": \"{policy}\",\n{pad2}\"min_frame_max\": {min_frame_max},\n{pad2}\"allow_small_frame_name_contains\": {allow},\n{pad2}\"blacklist_name_contains\": {blacklist},\n{pad2}\"case_insensitive\": {case_insensitive}\n{pad}}}",
+        "{{\n{pad2}\"spectrum\": {{\n{pad2}  \"enabled\": {enabled},\n{pad2}  \"term\": {term},\n{pad2}  \"life_time\": {life_time},\n{pad2}  \"color\": [{r}, {g}, {b}, {a}],\n{pad2}  \"effect\": \"{effect}\"\n{pad2}}},\n{pad2}\"existing_spectrum_policy\": \"{policy}\",\n{pad2}\"min_frame_max\": {min_frame_max},\n{pad2}\"allow_small_frame_name_contains\": {allow},\n{pad2}\"blacklist_name_contains\": {blacklist},\n{pad2}\"case_insensitive\": {case_insensitive},\n{pad2}\"direct_ani\": {direct_ani},\n{pad2}\"character_image_markers\": {character_image_markers}\n{pad}}}",
         enabled = config.spectrum.enabled,
         term = config.spectrum.term,
         life_time = config.spectrum.life_time,
@@ -2376,6 +2509,8 @@ fn config_json(config: &Config, indent: usize) -> String {
         allow = json_string_list(&config.allow_small_frame_name_contains),
         blacklist = json_string_list(&config.blacklist_name_contains),
         case_insensitive = config.case_insensitive,
+        direct_ani = config.direct_ani,
+        character_image_markers = json_string_list(&config.character_image_markers),
     )
 }
 
@@ -2805,9 +2940,9 @@ mod tests {
         let source = b"#PVF_File\r\n\r\n[LOOP]\r\n    1\r\n[FRAME MAX]\r\n    8\r\n";
         let out = insert_spectrum_before_frame_max(source, &Config::default().spectrum).unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("[SPECTRUM]\r\n    1\r\n"));
+        assert!(text.contains("[SPECTRUM]\r\n\t1\r\n"));
         assert!(text.find("[SPECTRUM]").unwrap() < text.find("[FRAME MAX]").unwrap());
-        assert!(text.contains("[SPECTRUM EFFECT]\r\n        `NONE`\r\n"));
+        assert!(text.contains("[SPECTRUM EFFECT]\r\n\t\t`NONE`\r\n"));
     }
 
     #[test]
@@ -2837,7 +2972,7 @@ mod tests {
 
         let report = out.join("report.csv");
         let (rows, manifest, archive_path) =
-            apply(&export, &out, &backup, &report, &Config::default()).unwrap();
+            apply(&export, &export, &out, &backup, &report, &Config::default()).unwrap();
         assert_eq!(
             rows.iter().filter(|row| row.decision == "modified").count(),
             1
@@ -2845,14 +2980,14 @@ mod tests {
         let modified =
             fs::read_to_string(out.join("character/swordman/Animation/Dash.ani")).unwrap();
         assert!(modified.contains("[SPECTRUM]"));
-        let untouched =
-            fs::read_to_string(out.join("character/swordman/Animation/Effect.ani")).unwrap();
-        assert!(!untouched.contains("[SPECTRUM]"));
+        // 只输出改过的文件：未修改的 Effect.ani 不会被复制到输出目录。
+        assert!(!out.join("character/swordman/Animation/Effect.ani").exists());
         assert_eq!(archive_path.extension().and_then(OsStr::to_str), Some("7z"));
         let archive_entries = seven_z_entry_names(&archive_path);
-        assert!(archive_entries.contains(&"character/swordman/swordman.chr".to_string()));
+        // 7z 里只有改过的 Dash.ani，不含未修改的 .chr 和 Effect.ani。
         assert!(archive_entries.contains(&"character/swordman/Animation/Dash.ani".to_string()));
-        assert!(archive_entries.contains(&"character/swordman/Animation/Effect.ani".to_string()));
+        assert!(!archive_entries.contains(&"character/swordman/swordman.chr".to_string()));
+        assert!(!archive_entries.contains(&"character/swordman/Animation/Effect.ani".to_string()));
         assert!(!archive_entries.contains(&"report.csv".to_string()));
         assert!(!archive_entries.contains(&"manifest.json".to_string()));
 
@@ -2863,13 +2998,172 @@ mod tests {
         assert!(!restored.contains("[SPECTRUM]"));
 
         let output_manifest = out.join("manifest.json");
-        apply(&export, &out, &backup, &report, &Config::default()).unwrap();
+        apply(&export, &export, &out, &backup, &report, &Config::default()).unwrap();
         restore(&output_manifest, &out, &restore_report).unwrap();
         let restored_from_output_manifest =
             fs::read_to_string(out.join("character/swordman/Animation/Dash.ani")).unwrap();
         assert!(!restored_from_output_manifest.contains("[SPECTRUM]"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn write_auto_route_tree(root: &Path) {
+        // common 下的公共动画（无 .chr，应自动走直接扫描）。
+        let common = root.join("character").join("common").join("animation");
+        fs::create_dir_all(&common).unwrap();
+        // 引用角色 avatar body 图 → 和人物相关，应处理。
+        fs::write(
+            common.join("town_move.ani"),
+            b"#PVF_File\n`Character/Swordman/Equipment/Avatar/skin/sm_body%04d.img`\n[FRAME MAX]\n    8\n",
+        )
+        .unwrap();
+        // 同样是 body 图，但文件名命中 Stay 黑名单。
+        fs::write(
+            common.join("Stay.ani"),
+            b"#PVF_File\n`Character/Swordman/Equipment/Avatar/skin/sm_body%04d.img`\n[FRAME MAX]\n    8\n",
+        )
+        .unwrap();
+        // 光环特效：引用的是特效图、不是角色 body → 应按 img 关键词跳过。
+        fs::write(
+            common.join("aura_glow.ani"),
+            b"#PVF_File\n`Character/Common/Aura/glow%04d.img`\n[FRAME MAX]\n    8\n",
+        )
+        .unwrap();
+        // 某角色目录下、没有被任何 .chr 引用、也不在 common 里的孤立 ani（引用 body 图）。
+        let job = root.join("character").join("swordman").join("animation");
+        fs::create_dir_all(&job).unwrap();
+        fs::write(
+            job.join("orphan.ani"),
+            b"#PVF_File\n`Character/Swordman/Equipment/Avatar/skin/sm_body%04d.img`\n[FRAME MAX]\n    8\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn resolve_base_scope_auto_derives_base_from_character() {
+        // 只填一个目录、指向 character 下面：自动把基准设为 character 上一级。
+        let (base, scope) = resolve_base_scope("D:/pvf/script/character/common", "");
+        assert_eq!(base, PathBuf::from("D:/pvf/script"));
+        assert_eq!(scope, PathBuf::from("D:/pvf/script/character/common"));
+
+        // 只填一个目录、不含 character 分量：整树处理，base == scope。
+        let (base, scope) = resolve_base_scope("D:/pvf/script", "");
+        assert_eq!(base, PathBuf::from("D:/pvf/script"));
+        assert_eq!(scope, PathBuf::from("D:/pvf/script"));
+
+        // 显式填了基准覆盖：直接采用，第一个框当处理范围。
+        let (base, scope) =
+            resolve_base_scope("D:/pvf/script/character/common", "D:/pvf/script");
+        assert_eq!(base, PathBuf::from("D:/pvf/script"));
+        assert_eq!(scope, PathBuf::from("D:/pvf/script/character/common"));
+    }
+
+    #[test]
+    fn default_output_goes_inside_export_root() {
+        // 处理 character：输出在 script 里面、按 scope 命名，而不是 script 同级的 script_spectrum。
+        let base = PathBuf::from("D:/dnf/script");
+        let (out, backup) = default_output_and_backup(&base, &base.join("character"));
+        assert_eq!(out, PathBuf::from("D:/dnf/script/character_spectrum"));
+        assert_eq!(backup, PathBuf::from("D:/dnf/script/character_spectrum_backup"));
+
+        // 处理 common：输出在 script 里、不进 character。
+        let (out, _) = default_output_and_backup(&base, &base.join("character").join("common"));
+        assert_eq!(out, PathBuf::from("D:/dnf/script/common_spectrum"));
+
+        // 整树（base == scope）：退回到基准同级，避免输出落在被处理目录里。
+        let (out, _) = default_output_and_backup(&base, &base);
+        assert_eq!(out, PathBuf::from("D:/dnf/script_spectrum"));
+    }
+
+    #[test]
+    fn common_anis_auto_routed_in_one_run() {
+        // 一次跑、自动分流：普通角色走 .chr；common 目录的 .ani 自动直接处理。
+        let root = unique_temp_dir("spectrum_tool_auto");
+        write_auto_route_tree(&root);
+
+        let rows = scan(&root, &root, &Config::default(), "scan").unwrap();
+        // common 下 3 个被评估；孤立的 swordman/orphan.ani 无 .chr 驱动又不在 common，不处理。
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| row.ani_path.contains("/common/")));
+        let town = rows
+            .iter()
+            .find(|row| row.ani_path.ends_with("town_move.ani"))
+            .unwrap();
+        assert_eq!(town.decision, "would_modify");
+        let stay = rows
+            .iter()
+            .find(|row| row.ani_path.ends_with("Stay.ani"))
+            .unwrap();
+        assert_eq!(stay.reason, "blacklist:Stay");
+        // 光环特效不引用角色 body 图 → 按 img 关键词跳过。
+        let aura = rows
+            .iter()
+            .find(|row| row.ani_path.ends_with("aura_glow.ani"))
+            .unwrap();
+        assert_eq!(aura.decision, "skipped");
+        assert_eq!(aura.reason, "skip_not_character_ani");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scope_limits_processing_but_keeps_full_paths() {
+        // 单独跑某个子目录：范围限定到 common，但相对路径仍以导出根为基准，保留完整前缀。
+        let root = unique_temp_dir("spectrum_tool_scope");
+        write_auto_route_tree(&root);
+        let scope = root.join("character").join("common");
+
+        let rows = scan(&root, &scope, &Config::default(), "scan").unwrap();
+        assert_eq!(rows.len(), 3);
+        // 路径基准仍是 root：条目带完整 character/common/ 前缀。
+        let town = rows
+            .iter()
+            .find(|row| row.ani_path.ends_with("town_move.ani"))
+            .unwrap();
+        assert_eq!(
+            town.ani_path,
+            "character/common/animation/town_move.ani"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn direct_ani_force_processes_every_ani_in_scope() {
+        // 高级覆盖：direct_ani=true 且清空 img 关键词（不按 img 过滤）时，
+        // scope 内每个 .ani 都直接处理——含孤立的 swordman/orphan 和光环特效。
+        let root = unique_temp_dir("spectrum_tool_force");
+        write_auto_route_tree(&root);
+
+        let mut config = Config::default();
+        config.direct_ani = true;
+        config.character_image_markers = Vec::new();
+        let rows = scan(&root, &root, &config, "scan").unwrap();
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().any(|row| row.ani_path.ends_with("orphan.ani")
+            && row.decision == "would_modify"));
+        // 关键词为空 → 光环特效也不再按 img 过滤。
+        assert!(rows.iter().any(|row| row.ani_path.ends_with("aura_glow.ani")
+            && row.decision == "would_modify"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn direct_ani_filters_non_character_by_image() {
+        // 默认 img 关键词下，直接扫描只处理引用角色 body 图的 .ani，光环特效被跳过。
+        assert!(references_character_image(
+            b"`Character/Swordman/Equipment/Avatar/skin/sm_body%04d.img`",
+            &["Equipment/Avatar/skin".to_string()],
+            true,
+        ));
+        assert!(!references_character_image(
+            b"`Character/Common/Aura/glow%04d.img`",
+            &["Equipment/Avatar/skin".to_string()],
+            true,
+        ));
+        // 关键词为空 → 不过滤，一律算“相关”。
+        assert!(references_character_image(b"`anything.img`", &[], true));
     }
 
     #[test]
@@ -2883,6 +3177,7 @@ mod tests {
         let outside_report = root.join("report.csv");
         let err = apply(
             &export,
+            &export,
             &inside_out,
             &outside_backup,
             &outside_report,
@@ -2895,6 +3190,7 @@ mod tests {
         let outside_out = root.join("out");
         let inside_backup = export.join("backup");
         let err = apply(
+            &export,
             &export,
             &outside_out,
             &inside_backup,
@@ -2932,7 +3228,7 @@ mod tests {
         )
         .unwrap();
 
-        let rows = scan(&export, &Config::default(), "scan").unwrap();
+        let rows = scan(&export, &export, &Config::default(), "scan").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].reason, "invalid_ani_path");
 

@@ -5,7 +5,7 @@
 ## 使用流程
 **覆盖前请自行备份pvf文件**
 1. 解压build_files\pvf_utility里的文件，然后通过里面的pvf编辑器打开你DNF目录里的.pvf文件
-2. ![提取文件](./提取文件.png)
+2. ![提取文件](./提取文件.png)，另外城镇里行走这个是在common文件夹里，有需要可以也导出来
 3. 提取文件时会导出到某个文件夹里，默认是pvf同目录的`script`文件夹里
 4. 运行build_files下面的spectrum_tool.exe
 5. 输入你的character路径到输入框里，注意确认好输出路径
