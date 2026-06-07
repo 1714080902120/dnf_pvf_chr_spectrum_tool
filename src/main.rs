@@ -1782,7 +1782,7 @@ fn remove_spectrum_block(bytes: &[u8]) -> Vec<u8> {
 
 fn spectrum_block(config: &SpectrumConfig, newline: &str) -> String {
     format!(
-        "[SPECTRUM]{newline}    1{newline}    [SPECTRUM TERM]{newline}        {term}{newline}    [SPECTRUM LIFE TIME]{newline}        {life_time}{newline}    [SPECTRUM COLOR]{newline}        {r}    {g}    {b}    {a}{newline}    [SPECTRUM EFFECT]{newline}        `{effect}`{newline}",
+        "[SPECTRUM]{newline}\t1{newline}\t[SPECTRUM TERM]{newline}\t\t{term}{newline}\t[SPECTRUM LIFE TIME]{newline}\t\t{life_time}{newline}\t[SPECTRUM COLOR]{newline}\t\t{r}\t{g}\t{b}\t{a}{newline}\t[SPECTRUM EFFECT]{newline}\t\t`{effect}`{newline}",
         term = config.term,
         life_time = config.life_time,
         r = config.color[0],
