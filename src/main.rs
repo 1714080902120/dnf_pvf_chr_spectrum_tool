@@ -96,6 +96,9 @@ struct ChrContext {
     job: String,
     body_path: Vec<u8>,
     body_path_text: String,
+    /// 城镇/简化身体图，形如 `Character/<职业>.img`。城镇的 SIMPLE_ 系列动画引用的是它，
+    /// 而不是 .chr 声明的 avatar body 图——不一起匹配的话城镇动作会被漏掉、城镇没残影。
+    simple_body_path: Vec<u8>,
     ani_refs: Vec<Vec<u8>>,
     /// true 表示这是一个独立的 `.ani` 目标（直接扫描，不做 body image path 匹配）；
     /// false 表示由 `.chr` 驱动、需要匹配角色 body。同一次运行里两者可以共存。
@@ -345,25 +348,26 @@ impl eframe::App for GuiApp {
                 ui.label("路径");
                 path_row(
                     ui,
-                    "PVF 导出目录 / 要处理的目录",
+                    "要处理的目录（填这一个就够）",
                     &mut self.export_root,
                     BrowseKind::Folder,
-                    "从 PVF 编辑器导出的原始目录；工具只读取，不直接修改。\
-                     只跑 common 时，直接把这里填成 …/character/common、下面那行留空即可——\
-                     工具会自动往上找到 character 那层作为路径基准，7z 前缀仍是 character/common/…，导回位置正确。",
+                    "你想加残影的目录，工具只读取、不改原文件。\
+                     跑整个角色就填 …/script/character；只跑 common 就填 …/script/character/common。\
+                     下面那行【留空】即可——工具会自动往上找到 character 那层算路径基准，\
+                     7z 前缀保持完整、导回位置正确，输出也会放在 script 里面。",
                 );
                 path_row(
                     ui,
-                    "路径基准(可选,一般留空)",
+                    "路径基准（高级·留空，几乎用不到）",
                     &mut self.base_override,
                     BrowseKind::Folder,
-                    "一般留空——工具会从上面的目录自动往上找到 character 那层做基准。\
-                     只有当自动识别不对时才手动填这里（应是含 character/ 的那层，例如 …/script）；\
-                     7z 内部路径会以它为基准计算，决定能否正确导回 PVF。",
+                    "⚠ 一般【不要填】，留空即可。仅当你的目录结构里没有名为 character 的层、\
+                     自动识别失败时才填（应是含 character/ 的那层，例如 …/script）。\
+                     注意它必须是上面目录的【上级】；填成下级会被自动忽略。",
                 );
                 if ui
-                    .button("根据导出目录生成默认路径")
-                    .on_hover_text("自动生成输出目录、备份目录和报告路径（始终放在导出目录同级，不会落进源目录里）。")
+                    .button("根据上面目录生成默认路径")
+                    .on_hover_text("自动生成输出/备份/报告路径：输出放在 script 里、按处理目录命名，不会落进 character/common 里面。")
                     .clicked()
                 {
                     self.fill_default_paths();
@@ -1019,8 +1023,10 @@ fn existing_policy_label(policy: ExistingPolicy) -> &'static str {
 /// 由用户填的“要处理的目录”和可选的“路径基准覆盖”推导出 (路径基准 base, 处理范围 scope)。
 ///
 /// `target` 永远是“要处理的目录”(= scope)。
-/// - 填了 `base_override`：直接用它做基准（显式，最灵活）。
-/// - 留空：如果 target 位于某个 `character` 目录里（或就是 character 目录），自动把基准设为
+/// - 填了 `base_override` 且它确实是 target 的上级（或相等）：用它做基准。
+///   如果填反了（base_override 不是 target 的上级，比如把 character 当 target、把 common 当基准），
+///   则忽略它、转为自动推导，避免出现 scope 在 root 外面、报 “path is outside root” 的情况。
+/// - 留空或被忽略：如果 target 位于某个 `character` 目录里（或就是 character 目录），自动把基准设为
 ///   `character` 的上一级——这样即使只填一个框、直接指向 `…/character/common`，7z 里仍是
 ///   `character/common/…` 的完整前缀，导回位置正确。找不到 `character` 分量时退回到
 ///   base = scope = target（整树处理，适合直接填含 character/ 的导出根目录）。
@@ -1028,7 +1034,11 @@ fn resolve_base_scope(target: &str, base_override: &str) -> (PathBuf, PathBuf) {
     let scope = PathBuf::from(target.trim());
     let base_text = base_override.trim();
     if !base_text.is_empty() {
-        return (PathBuf::from(base_text), scope);
+        let base = PathBuf::from(base_text);
+        if path_is_same_or_inside(&scope, &base).unwrap_or(false) {
+            return (base, scope);
+        }
+        // base_override 不是 scope 的上级（多半是两个框填反了）→ 忽略，走自动推导。
     }
     match base_above_character(&scope) {
         Some(base) => (base, scope),
@@ -1765,6 +1775,7 @@ fn load_ani_contexts(
             job: String::new(),
             body_path: Vec::new(),
             body_path_text: String::new(),
+            simple_body_path: Vec::new(),
             ani_refs: vec![file_name],
             direct_ani: true,
         });
@@ -1786,6 +1797,14 @@ fn load_chr_contexts(root: &Path, scope: &Path) -> AppResult<Vec<ChrContext>> {
             .parent()
             .ok_or_else(|| format!("chr path has no parent: {}", chr_path.display()))?
             .to_path_buf();
+        // 城镇/简化身体图：形如 Character/<职业>.img、Character/at<职业>.img（一觉）、
+        // Character/demonic<职业>.img（二觉）等，都以 `<职业>.img` 结尾。用这个后缀匹配，
+        // 一并覆盖本体和各觉醒形态的城镇 SIMPLE_ 动画。
+        let simple_body_path = chr_dir
+            .file_name()
+            .and_then(OsStr::to_str)
+            .map(|name| format!("{name}.img").into_bytes())
+            .unwrap_or_default();
         let job = extract_section_backtick_value(&bytes, b"[job]")
             .map(|value| display_bytes(&value))
             .unwrap_or_default();
@@ -1796,6 +1815,7 @@ fn load_chr_contexts(root: &Path, scope: &Path) -> AppResult<Vec<ChrContext>> {
                 job,
                 body_path: Vec::new(),
                 body_path_text: String::new(),
+                simple_body_path,
                 ani_refs: Vec::new(),
                 direct_ani: false,
             });
@@ -1808,6 +1828,7 @@ fn load_chr_contexts(root: &Path, scope: &Path) -> AppResult<Vec<ChrContext>> {
             job,
             body_path_text: display_bytes(&body_path),
             body_path,
+            simple_body_path,
             ani_refs,
             direct_ani: false,
         });
@@ -1880,7 +1901,15 @@ fn evaluate_ani(
             row.reason = "skip_not_character_ani".to_string();
             return Ok(row);
         }
-    } else if !contains_body_image_path(&bytes, &context.body_path, config.case_insensitive) {
+    } else if !contains_body_image_path(&bytes, &context.body_path, config.case_insensitive)
+        && !(!context.simple_body_path.is_empty()
+            && contains_normalized_path(
+                &bytes,
+                &context.simple_body_path,
+                config.case_insensitive,
+            ))
+    {
+        // 既不匹配 avatar body 图，也不匹配城镇/简化身体图 Character/<职业>.img → 不是人物动作。
         row.reason = "skip_not_body_ani".to_string();
         return Ok(row);
     }
@@ -3007,6 +3036,44 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn matches_town_simple_body_image() {
+        // 城镇 SIMPLE_ 动画引用的是 Character/<职业>.img，不是 .chr 声明的 avatar body 图。
+        // 必须也匹配它（含 at/demonic 觉醒前缀），否则城镇没有残影。
+        let root = unique_temp_dir("spectrum_tool_simple");
+        let chr_dir = root.join("character").join("swordman");
+        let ani_dir = chr_dir.join("Animation");
+        fs::create_dir_all(&ani_dir).unwrap();
+        fs::write(
+            chr_dir.join("swordman.chr"),
+            b"[body image path]\n    `Character/Swordman/Equipment/Avatar/skin/sm_body%04d.img`\n[simple move motion]\n    `Animation/SIMPLE_Move.ani`\n    `Animation/SIMPLE_Move_at.ani`\n",
+        )
+        .unwrap();
+        // 本体城镇移动：引用 Character/swordman.img。
+        fs::write(
+            ani_dir.join("SIMPLE_Move.ani"),
+            b"#PVF_File\n`Character/swordman.img`\n[FRAME MAX]\n    8\n",
+        )
+        .unwrap();
+        // 觉醒形态城镇移动：引用 Character/atswordman.img（后缀仍是 swordman.img）。
+        fs::write(
+            ani_dir.join("SIMPLE_Move_at.ani"),
+            b"#PVF_File\n`Character/atswordman.img`\n[FRAME MAX]\n    8\n",
+        )
+        .unwrap();
+
+        let rows = scan(&root, &root, &Config::default(), "scan").unwrap();
+        for name in ["SIMPLE_Move.ani", "SIMPLE_Move_at.ani"] {
+            let row = rows
+                .iter()
+                .find(|r| r.ani_path.ends_with(name))
+                .unwrap_or_else(|| panic!("missing row for {name}"));
+            assert_eq!(row.decision, "would_modify", "{name} 应被处理");
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn write_auto_route_tree(root: &Path) {
         // common 下的公共动画（无 .chr，应自动走直接扫描）。
         let common = root.join("character").join("common").join("animation");
@@ -3051,11 +3118,20 @@ mod tests {
         assert_eq!(base, PathBuf::from("D:/pvf/script"));
         assert_eq!(scope, PathBuf::from("D:/pvf/script"));
 
-        // 显式填了基准覆盖：直接采用，第一个框当处理范围。
+        // 显式填了基准覆盖（确实是上级）：直接采用，第一个框当处理范围。
         let (base, scope) =
             resolve_base_scope("D:/pvf/script/character/common", "D:/pvf/script");
         assert_eq!(base, PathBuf::from("D:/pvf/script"));
         assert_eq!(scope, PathBuf::from("D:/pvf/script/character/common"));
+
+        // 防呆：两个框填反了（基准填成了处理目录的下级 common，处理目录填成 character）。
+        // base_override 不是 scope 的上级 → 忽略，自动推导出正确的基准 script。
+        let (base, scope) = resolve_base_scope(
+            "D:/pvf/script/character",
+            "D:/pvf/script/character/common",
+        );
+        assert_eq!(base, PathBuf::from("D:/pvf/script"));
+        assert_eq!(scope, PathBuf::from("D:/pvf/script/character"));
     }
 
     #[test]
