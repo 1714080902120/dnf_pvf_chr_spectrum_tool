@@ -2305,8 +2305,8 @@ fn default_7z_path(out: &Path) -> PathBuf {
         .join(format!("{name}.7z"))
 }
 
-/// 把指定的相对路径列表打包成 7z（只打改过的文件，覆盖合并导入即可）。
-/// `entries` 是相对 `output_root` 的条目路径（也就是 7z 内部路径，保留 character/... 完整前缀）。
+/// 把指定的相对路径列表按 ZIP 格式打包，再重命名为 7z（只打改过的文件，覆盖合并导入即可）。
+/// `entries` 是相对 `output_root` 的条目路径（也就是压缩包内部路径，保留 character/... 完整前缀）。
 fn pack_entries_to_7z(
     output_root: &Path,
     entries: &[String],
@@ -2329,8 +2329,12 @@ fn pack_entries_to_7z(
         list_content.extend_from_slice(b"\r\n");
     }
 
+    let zip_path = archive_path.with_extension("7z.tmp.zip");
     if archive_path.exists() {
         fs::remove_file(archive_path)?;
+    }
+    if zip_path.exists() {
+        fs::remove_file(&zip_path)?;
     }
 
     let list_path = archive_path.with_extension("7z.list.txt");
@@ -2342,18 +2346,15 @@ fn pack_entries_to_7z(
     let log_out = fs::File::create(&log_path)?;
     let log_err = log_out.try_clone()?;
 
-    // -m0=lzma + 较低的 -mx：对纯文本 .ani 压缩比几乎一样，但速度快几十倍
-    //（整棵 character 树从 -mx=9 的约 3.5 分钟降到约 8 秒），同时字典更小、用 LZMA1，
-    // 老旧的 SevenZipSharp 读取引擎兼容性也更好。
+    // 先创建真正的 ZIP，再改名成 .7z，兼容只看扩展名的导入流程。
     let spawned = command_no_window(&seven_zip)
         .current_dir(output_root)
         .arg("a")
-        .arg("-t7z")
-        .arg("-m0=lzma")
+        .arg("-tzip")
         .arg("-mx=3")
         .arg("-y")
         .arg("-scsUTF-8")
-        .arg(archive_path)
+        .arg(&zip_path)
         .arg(format!("@{}", list_path.display()))
         .stdout(Stdio::from(log_out))
         .stderr(Stdio::from(log_err))
@@ -2364,6 +2365,7 @@ fn pack_entries_to_7z(
         Err(err) => {
             let _ = fs::remove_file(&list_path);
             let _ = fs::remove_file(&log_path);
+            let _ = fs::remove_file(&zip_path);
             return Err(format!("启动 7z 失败：{err}").into());
         }
     };
@@ -2383,6 +2385,7 @@ fn pack_entries_to_7z(
             Err(err) => {
                 let _ = fs::remove_file(&list_path);
                 let _ = fs::remove_file(&log_path);
+                let _ = fs::remove_file(&zip_path);
                 return Err(format!("等待 7z 失败：{err}").into());
             }
         }
@@ -2392,9 +2395,11 @@ fn pack_entries_to_7z(
     if !status.success() {
         let log = fs::read_to_string(&log_path).unwrap_or_default();
         let _ = fs::remove_file(&log_path);
+        let _ = fs::remove_file(&zip_path);
         return Err(format!("7z 打包失败：{}", log.trim()).into());
     }
     let _ = fs::remove_file(&log_path);
+    fs::rename(&zip_path, archive_path)?;
     Ok(())
 }
 
@@ -3012,6 +3017,7 @@ mod tests {
         // 只输出改过的文件：未修改的 Effect.ani 不会被复制到输出目录。
         assert!(!out.join("character/swordman/Animation/Effect.ani").exists());
         assert_eq!(archive_path.extension().and_then(OsStr::to_str), Some("7z"));
+        assert!(fs::read(&archive_path).unwrap().starts_with(b"PK"));
         let archive_entries = seven_z_entry_names(&archive_path);
         // 7z 里只有改过的 Dash.ani，不含未修改的 .chr 和 Effect.ani。
         assert!(archive_entries.contains(&"character/swordman/Animation/Dash.ani".to_string()));
